@@ -2514,6 +2514,85 @@ export class Queue<T = any> {
       return false;
     }
   }
+
+  /**
+   * Get the current state of a job
+   * Returns 'active', 'delayed', 'waiting', 'completed', 'failed', or 'unknown'
+   */
+  async getJobState(
+    jobId: string,
+  ): Promise<Status | 'unknown'> {
+    // Check if job is in processing set (active)
+    const inProcessing = await this.r.zscore(`${this.ns}:processing`, jobId);
+    if (inProcessing !== null) {
+      return 'active';
+    }
+
+    // Check if job is delayed
+    const inDelayed = await this.r.zscore(`${this.ns}:delayed`, jobId);
+    if (inDelayed !== null) {
+      return 'delayed';
+    }
+
+    // Check if job is completed
+    const inCompleted = await this.r.zscore(`${this.ns}:completed`, jobId);
+    if (inCompleted !== null) {
+      return 'completed';
+    }
+
+    // Check if job is failed
+    const inFailed = await this.r.zscore(`${this.ns}:failed`, jobId);
+    if (inFailed !== null) {
+      return 'failed';
+    }
+
+    // Check if job is waiting (need to check job hash for groupId)
+    const jobKey = `${this.ns}:job:${jobId}`;
+    const groupId = await this.r.hget(jobKey, 'groupId');
+    if (groupId) {
+      const inGroup = await this.r.zscore(`${this.ns}:g:${groupId}`, jobId);
+      if (inGroup !== null) {
+        return 'waiting';
+      }
+    }
+
+    return 'unknown';
+  }
+
+  /**
+   * Cancel a running job by publishing a cancel event via pub/sub.
+   * The worker processing the job will receive an abort signal.
+   *
+   * @param jobId The ID of the job to cancel
+   * @returns true if the job was active and cancel event was published, false otherwise
+   *
+   * @example
+   * ```ts
+   * const cancelled = await queue.cancel(jobId);
+   * if (cancelled) {
+   *   console.log('Job cancellation signal sent');
+   * } else {
+   *   console.log('Job was not active (may have completed or not started)');
+   * }
+   * ```
+   */
+  async cancel(jobId: string): Promise<boolean> {
+    // Check if job exists and is in active (processing) state
+    const state = await this.getJobState(jobId);
+    if (state !== 'active') {
+      this.logger.debug(
+        `Cannot cancel job ${jobId}: job is not active (state: ${state})`,
+      );
+      return false;
+    }
+
+    // Publish cancel event via pub/sub
+    const cancelChannel = `${this.ns}:cancel`;
+    await this.r.publish(cancelChannel, jobId);
+
+    this.logger.debug(`Published cancel event for job ${jobId}`);
+    return true;
+  }
 }
 
 function sleep(ms: number): Promise<void> {

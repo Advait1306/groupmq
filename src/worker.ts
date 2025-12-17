@@ -92,9 +92,10 @@ export type WorkerOptions<T> = {
   /**
    * The function that processes jobs. Must be async and handle job failures gracefully.
    * @param job The reserved job to process
+   * @param signal AbortSignal that is aborted when the job is cancelled
    * @returns Promise that resolves when job is complete
    */
-  handler: (job: ReservedJob<T>) => Promise<unknown>;
+  handler: (job: ReservedJob<T>, signal: AbortSignal) => Promise<unknown>;
 
   /**
    * Heartbeat interval in milliseconds to keep jobs alive during processing.
@@ -320,6 +321,10 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
   // Track all jobs in progress (for all concurrency levels)
   private jobsInProgress = new Set<{ job: ReservedJob<T>; ts: number }>();
 
+  // AbortController tracking for job cancellation
+  private abortControllers = new Map<string, AbortController>();
+  private cancelSubscriber: import('ioredis').default | null = null;
+
   // Blocking detection and monitoring
   private lastJobPickupTime = Date.now(); // Initialize to now so we start in "active" mode
   private totalJobsProcessed = 0;
@@ -428,6 +433,39 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
     }
   }
 
+  /**
+   * Set up the Redis subscriber for job cancellation events
+   */
+  private async setupCancelSubscriber(): Promise<void> {
+    try {
+      this.cancelSubscriber = this.q.redis.duplicate({
+        maxRetriesPerRequest: null,
+      });
+
+      const cancelChannel = `${this.q.namespace}:cancel`;
+      await this.cancelSubscriber.subscribe(cancelChannel);
+
+      this.cancelSubscriber.on('message', (_channel: string, jobId: string) => {
+        const controller = this.abortControllers.get(jobId);
+        if (controller) {
+          this.logger.debug(`Cancelling job ${jobId} via abort signal`);
+          controller.abort();
+        }
+      });
+
+      this.cancelSubscriber.on('error', (err) => {
+        if (!this.stopping) {
+          this.logger.error('Cancel subscriber error:', err);
+        }
+      });
+
+      this.logger.debug(`Subscribed to cancel channel: ${cancelChannel}`);
+    } catch (err) {
+      this.logger.error('Failed to set up cancel subscriber:', err);
+      this.cancelSubscriber = null;
+    }
+  }
+
   async run(): Promise<void> {
     if (this.runLoopPromise) {
       return this.runLoopPromise;
@@ -487,6 +525,9 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
       this.logger.error('Failed to create blocking client:', err);
       this.blockingClient = null; // fall back to queue's blocking client
     }
+
+    // Set up cancel subscriber for job cancellation via pub/sub
+    await this.setupCancelSubscriber();
 
     // Start cleanup timer if enabled
     if (this.enableCleanup) {
@@ -1040,6 +1081,13 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
       this.logger.warn(
         `Worker stopped with ${this.jobsInProgress.size} jobs still processing after ${gracefulTimeoutMs}ms timeout.`,
       );
+
+      // Abort all remaining jobs after graceful timeout
+      for (const [jobId, controller] of this.abortControllers) {
+        this.logger.debug(`Aborting job ${jobId} due to worker shutdown`);
+        controller.abort();
+      }
+
       // Emit graceful-timeout event for each job still processing
       const nowWall = Date.now();
       for (const item of this.jobsInProgress) {
@@ -1054,7 +1102,19 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
       }
     }
 
+    // Clean up cancel subscriber
+    if (this.cancelSubscriber) {
+      try {
+        await this.cancelSubscriber.unsubscribe();
+        this.cancelSubscriber.disconnect();
+      } catch (err) {
+        this.logger.debug('Error closing cancel subscriber:', err);
+      }
+      this.cancelSubscriber = null;
+    }
+
     // Clear tracking
+    this.abortControllers.clear();
     this.jobsInProgress.clear();
     this.ready = false;
     this.closed = true;
@@ -1127,6 +1187,10 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
   ): Promise<void | ReservedJob<T>> {
     const jobStartWallTime = Date.now();
 
+    // Create AbortController for this job
+    const abortController = new AbortController();
+    this.abortControllers.set(job.id, abortController);
+
     let hbTimer: NodeJS.Timeout | undefined;
     let heartbeatDelayTimer: NodeJS.Timeout | undefined;
 
@@ -1192,8 +1256,8 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
         startHeartbeat();
       }, heartbeatThreshold);
 
-      // Execute the user's handler
-      const handlerResult = await this.handler(job);
+      // Execute the user's handler with abort signal
+      const handlerResult = await this.handler(job, abortController.signal);
 
       // Job finished quickly, cancel delayed heartbeat start
       if (heartbeatDelayTimer) {
@@ -1244,6 +1308,9 @@ class _Worker<T = any> extends TypedEventEmitter<WorkerEvents<T>> {
         clearInterval(hbTimer);
       }
       await this.handleJobFailure(err, job, jobStartWallTime);
+    } finally {
+      // Clean up abort controller for this job
+      this.abortControllers.delete(job.id);
     }
   }
 
