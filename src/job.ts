@@ -102,6 +102,16 @@ export class Job<T = any> {
     await this.updateData(jobData);
   }
 
+  /**
+   * Cancel this job if it is currently being processed.
+   * Sends an abort signal to the worker processing this job.
+   *
+   * @returns true if the job was active and cancel signal was sent, false otherwise
+   */
+  async cancel(): Promise<boolean> {
+    return this.queue.cancel(this.id);
+  }
+
   static fromReserved<T = any>(
     queue: Queue<T>,
     reserved: ReservedJob<T>,
